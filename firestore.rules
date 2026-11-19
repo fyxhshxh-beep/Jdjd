@@ -1,0 +1,146 @@
+rules_version = '2';
+
+// FriendCall Firestore rules.
+//
+// Data model
+//   users/{uid}                          { uid, email }
+//   friendRequests/{fromUid}_{toUid}     { fromUid, fromEmail, toUid, toEmail, status, createdAt }
+//   friendships/{uidA}_{uidB}            { members:[a,b] (sorted), emails:[ea,eb] (same order), createdAt }
+//   chats/{friendshipId}/messages/{id}   { senderUid, senderEmail, type, text, room?, createdAt }
+//
+// Key guarantees
+//   * A friendship can only be created by the recipient of a pending request
+//     (the client creates it and deletes the request in one atomic batch).
+//   * Messages can only be read/written by the two members of the friendship.
+//   * Messages are immutable, size-limited, and timestamped by the server.
+//   * Users cannot be listed in bulk (lookup by email is limited to 1 result).
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function myEmail() {
+      return request.auth.token.email.lower();
+    }
+
+    // ---------------------------------------------------------------- users
+    match /users/{uid} {
+      allow get: if signedIn();
+      allow list: if signedIn() && request.query.limit <= 1;
+
+      allow create, update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['uid', 'email'])
+        && request.resource.data.uid == uid
+        && request.resource.data.email == myEmail();
+
+      allow delete: if false;
+    }
+
+    // -------------------------------------------------------- friendRequests
+    match /friendRequests/{requestId} {
+      allow read: if signedIn()
+        && (resource.data.fromUid == request.auth.uid
+            || resource.data.toUid == request.auth.uid);
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(
+             ['fromUid', 'fromEmail', 'toUid', 'toEmail', 'status', 'createdAt'])
+        && request.resource.data.fromUid == request.auth.uid
+        && request.resource.data.toUid is string
+        && request.resource.data.toUid != request.auth.uid
+        && request.resource.data.fromEmail == myEmail()
+        && request.resource.data.toEmail is string
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time
+        && requestId == request.auth.uid + '_' + request.resource.data.toUid
+        && exists(/databases/$(database)/documents/users/$(request.resource.data.toUid));
+
+      allow update: if false;
+
+      // Recipient declines / accepts (client deletes), sender cancels.
+      allow delete: if signedIn()
+        && (resource.data.fromUid == request.auth.uid
+            || resource.data.toUid == request.auth.uid);
+    }
+
+    // ----------------------------------------------------------- friendships
+    function otherMember(members) {
+      return members[0] == request.auth.uid ? members[1] : members[0];
+    }
+
+    function pendingRequestPath(members) {
+      return /databases/$(database)/documents/friendRequests/$(otherMember(members) + '_' + request.auth.uid);
+    }
+
+    match /friendships/{friendshipId} {
+      allow get: if signedIn()
+        && (resource == null || request.auth.uid in resource.data.members);
+      allow list: if signedIn()
+        && request.auth.uid in resource.data.members;
+
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['members', 'emails', 'createdAt'])
+        && request.resource.data.members.size() == 2
+        && request.resource.data.emails.size() == 2
+        && request.auth.uid in request.resource.data.members
+        && request.resource.data.members[0] < request.resource.data.members[1]
+        && friendshipId == request.resource.data.members[0] + '_' + request.resource.data.members[1]
+        && request.resource.data.createdAt == request.time
+        // must be accepting a real, pending request addressed to me
+        && exists(pendingRequestPath(request.resource.data.members))
+        && get(pendingRequestPath(request.resource.data.members)).data.toUid == request.auth.uid
+        // emails line up with members and are not spoofed
+        && (request.resource.data.members[0] == request.auth.uid
+              ? (request.resource.data.emails[0] == myEmail()
+                 && request.resource.data.emails[1] == get(pendingRequestPath(request.resource.data.members)).data.fromEmail)
+              : (request.resource.data.emails[1] == myEmail()
+                 && request.resource.data.emails[0] == get(pendingRequestPath(request.resource.data.members)).data.fromEmail));
+
+      allow update: if false;
+
+      // Either member can remove the friendship.
+      allow delete: if signedIn() && request.auth.uid in resource.data.members;
+    }
+
+    // ----------------------------------------------------------------- chats
+    match /chats/{chatId}/messages/{messageId} {
+      function friendshipPath() {
+        return /databases/$(database)/documents/friendships/$(chatId);
+      }
+
+      function isMember() {
+        return signedIn()
+          && exists(friendshipPath())
+          && request.auth.uid in get(friendshipPath()).data.members;
+      }
+
+      function validMessage() {
+        let d = request.resource.data;
+        return d.keys().hasAll(['senderUid', 'senderEmail', 'type', 'text', 'createdAt'])
+          && d.keys().hasOnly(['senderUid', 'senderEmail', 'type', 'text', 'room', 'createdAt'])
+          && d.senderUid == request.auth.uid
+          && d.senderEmail == myEmail()
+          && d.createdAt == request.time
+          && d.text is string
+          && (
+            (d.type == 'text'
+              && d.text.size() >= 1 && d.text.size() <= 2000
+              && !('room' in d))
+            ||
+            (d.type == 'call'
+              && d.text.size() <= 200
+              && d.room is string
+              && d.room.matches('^[A-Za-z0-9]{8,64}$'))
+          );
+      }
+
+      allow read: if isMember();
+      allow create: if isMember() && validMessage();
+      allow update, delete: if false;
+    }
+  }
+}
